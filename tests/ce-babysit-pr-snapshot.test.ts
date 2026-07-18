@@ -143,6 +143,21 @@ function extractFeedback(view: unknown): any[] {
   return JSON.parse(r.stdout.trim())
 }
 
+function eyesReactionIdentities(pages: unknown): string[] {
+  const r = spawnSync(
+    "python3",
+    [
+      "-c",
+      `import json; from importlib.machinery import SourceFileLoader; ` +
+        `m=SourceFileLoader('prs', ${JSON.stringify(SCRIPT)}).load_module(); ` +
+        `print(json.dumps(m._eyes_reaction_identities(json.loads(${JSON.stringify(JSON.stringify(pages))}))))`,
+    ],
+    { encoding: "utf8" },
+  )
+  expect(r.status, r.stderr).toBe(0)
+  return JSON.parse(r.stdout.trim())
+}
+
 function probeChain(options: {
   pr?: number
   url?: string
@@ -1782,18 +1797,146 @@ print(json.dumps({"ids": [t["thread_id"] for t in threads], "calls": calls}))
     expect(watch(path.join(dir, "wfc"), fetchFile(dir, "wfc.json", candidate)).reason).toBe("feedback-candidate")
   }, 15000)
 
-  test("watch: an in-progress review signal blocks the merge-ready wake regardless of quiet time", () => {
-    // "Looks ready" is signal-gated: a green/CLEAN PR with a review still in flight (review_in_progress)
-    // must NOT wake merge-ready even with a zero settle window — time is not the gate.
-    const GREEN = { key: "CI/test", name: "test", status: "COMPLETED", conclusion: "SUCCESS", details_url: "u" }
-    const base = { ...FAILING, merge_state_status: "CLEAN", review_decision: "APPROVED", threads: [], checks: [GREEN] }
-    const inprog = fetchFile(dir, "rip1.json", { ...base, review_in_progress: true })
-    const inProgressDir = path.join(dir, "rip1")
-    snapshot(inProgressDir, inprog, EXPIRING_TEST_INVOCATION)
-    expect(watch(inProgressDir, inprog, ["--settle-seconds", "0"]).reason).toBe("max-runtime")
-    const nosig = fetchFile(dir, "rip2.json", { ...base, review_in_progress: false })
-    expect(watch(path.join(dir, "rip2"), nosig, ["--settle-seconds", "0"]).reason).toBe("merge-ready")
-  }, 15000)
+  test("watch: an in-progress review signal blocks until the 15-minute stale-review check", () => {
+    const base = {
+      ...FAILING,
+      merge_state_status: "CLEAN",
+      review_decision: "APPROVED",
+      threads: [],
+      checks: [GREEN_CHECK],
+      counts: { threads: 0, ci: 0, comments: 0 },
+      checks_terminal: true,
+      has_failing_checks: false,
+      checks_awaiting_approval: 0,
+      open_needs_human: 0,
+      stack_blocker: null,
+    }
+    expect(wakeReason({ ...base, review_in_progress: true, quiet_seconds: 899 }, 0)).toBeNull()
+    expect(wakeReason({ ...base, review_in_progress: true, quiet_seconds: 900 }, 0)).toBe("merge-ready")
+    expect(wakeReason({ ...base, review_in_progress: false, quiet_seconds: 0 }, 0)).toBe("merge-ready")
+  })
+
+  test("snapshot: remembers an incomplete current-head review after the eyes signal disappears", () => {
+    const base = {
+      ...FAILING,
+      merge_state_status: "CLEAN",
+      review_decision: "APPROVED",
+      threads: [],
+      checks: [GREEN_CHECK],
+    }
+
+    snapshot(state, fetchFile(dir, "signal-absent.json", { ...base, review_in_progress: false }))
+    const statePath = path.join(state, "state.json")
+    const prior = JSON.parse(readFileSync(statePath, "utf8"))
+    prior.last_change_at = "2026-07-17T12:00:00+00:00"
+    writeFileSync(statePath, JSON.stringify(prior))
+
+    const started = snapshot(state, fetchFile(dir, "signal-started.json", { ...base, review_in_progress: true }))
+    expect(started.review_signal_seen_on_head).toBe(true)
+    expect(started.review_signal_first_seen_at).toBe(started.review_signal_last_changed_at)
+    expect(started.review_signal_first_seen_at).not.toBe(prior.last_change_at)
+    const firstSeenAt = started.review_signal_first_seen_at
+
+    const disappeared = snapshot(state, fetchFile(dir, "signal-disappeared.json", { ...base, review_in_progress: false }))
+    expect(disappeared.review_in_progress).toBe(false)
+    expect(disappeared.review_signal_seen_on_head).toBe(true)
+    expect(disappeared.review_signal_first_seen_at).toBe(firstSeenAt)
+    expect(disappeared.review_signal_last_changed_at).not.toBe(firstSeenAt)
+    expect(disappeared.changed_this_tick).toBe(true)
+    expect(disappeared.quiet_seconds).toBeLessThan(2)
+
+    const nextHead = snapshot(state, fetchFile(dir, "signal-new-head.json", {
+      ...base,
+      head_sha: "s2",
+      review_in_progress: false,
+    }))
+    expect(nextHead.review_signal_seen_on_head).toBe(false)
+    expect(nextHead.review_signal_first_seen_at).toBeNull()
+    expect(nextHead.review_signal_last_changed_at).toBeNull()
+  })
+
+  test("snapshot: eyes identity changes reset quiet time even when the count stays fixed", () => {
+    expect(eyesReactionIdentities([[
+      { content: "eyes", user: { node_id: "U_bot_b" } },
+      { content: "eyes", user: { node_id: "U_bot_a" } },
+      { content: "+1", user: { node_id: "U_other" } },
+    ]])).toEqual(["U_bot_a", "U_bot_b"])
+
+    const base = {
+      ...FAILING,
+      merge_state_status: "CLEAN",
+      review_decision: "APPROVED",
+      threads: [],
+      checks: [GREEN_CHECK],
+      review_in_progress: true,
+    }
+    const first = snapshot(state, fetchFile(dir, "signal-count-one.json", {
+      ...base,
+      review_signal_identities: ["U_bot_a"],
+    }))
+    expect(first.review_signal_count).toBe(1)
+    expect(first.review_signal_identities).toEqual(["U_bot_a"])
+    const statePath = path.join(state, "state.json")
+    const prior = JSON.parse(readFileSync(statePath, "utf8"))
+    prior.last_change_at = "2026-07-17T12:00:00+00:00"
+    prior.review_signal_last_changed_at = prior.last_change_at
+    writeFileSync(statePath, JSON.stringify(prior))
+
+    const swapped = snapshot(state, fetchFile(dir, "signal-reviewer-swapped.json", {
+      ...base,
+      review_signal_identities: ["U_bot_b"],
+    }))
+    expect(swapped.review_in_progress).toBe(true)
+    expect(swapped.review_signal_count).toBe(1)
+    expect(swapped.review_signal_identities).toEqual(["U_bot_b"])
+    expect(swapped.review_signal_last_changed_at).not.toBe(prior.review_signal_last_changed_at)
+    expect(swapped.changed_this_tick).toBe(true)
+    expect(swapped.quiet_seconds).toBeLessThan(2)
+
+    const persisted = JSON.parse(readFileSync(statePath, "utf8"))
+    persisted.last_change_at = "2026-07-17T12:00:00+00:00"
+    persisted.review_signal_last_changed_at = persisted.last_change_at
+    writeFileSync(statePath, JSON.stringify(persisted))
+
+    const unchanged = snapshot(state, fetchFile(dir, "signal-reviewer-unchanged.json", {
+      ...base,
+      review_signal_identities: ["U_bot_b"],
+    }))
+    expect(unchanged.review_in_progress).toBe(true)
+    expect(unchanged.review_signal_count).toBe(1)
+    expect(unchanged.changed_this_tick).toBe(false)
+    expect(unchanged.quiet_seconds).toBeGreaterThan(60)
+  })
+
+  test("snapshot: a count-only legacy review signal migrates to reactor identities", () => {
+    const base = {
+      ...FAILING,
+      merge_state_status: "CLEAN",
+      review_decision: "APPROVED",
+      threads: [],
+      checks: [GREEN_CHECK],
+      review_in_progress: true,
+      review_signal_count: 1,
+    }
+    snapshot(state, fetchFile(dir, "signal-legacy-count.json", base))
+    const statePath = path.join(state, "state.json")
+    const legacy = JSON.parse(readFileSync(statePath, "utf8"))
+    delete legacy.review_signal_identities
+    legacy.last_change_at = "2026-07-17T12:00:00+00:00"
+    legacy.review_signal_last_changed_at = legacy.last_change_at
+    writeFileSync(statePath, JSON.stringify(legacy))
+
+    const migrated = snapshot(state, fetchFile(dir, "signal-identity-aware.json", {
+      ...base,
+      review_signal_identities: ["U_bot_a"],
+    }))
+    expect(migrated.review_in_progress).toBe(true)
+    expect(migrated.review_signal_count).toBe(1)
+    expect(migrated.review_signal_identities).toEqual(["U_bot_a"])
+    expect(migrated.review_signal_seen_on_head).toBe(true)
+    expect(migrated.changed_this_tick).toBe(true)
+    expect(migrated.quiet_seconds).toBeLessThan(2)
+  })
 
   test("watch: a no-check MERGEABLE/CLEAN PR still reaches merge-ready (the >=1-check guard is pipeline-only)", () => {
     // A repo with no configured checks: all_checks_ok is false (no observed check), but the
